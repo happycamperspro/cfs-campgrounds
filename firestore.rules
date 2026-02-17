@@ -1,0 +1,830 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // --- HELPER FUNCTIONS (UNCHANGED) ---
+    
+    // 0. Age Validation Helper
+    function isAdult(dob) {
+      return dob != null && request.time >= dob + duration.value(568036800, 's');
+    }
+    
+    // 1. Check if user has an 'active' membership
+    function isMember(campgroundId) {
+      return request.auth != null && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)/memberships/$(campgroundId)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)/memberships/$(campgroundId)).data.status == 'active';
+    }
+
+    // 2. Check if user is a Super Admin
+    function isSuperAdmin() {
+       return request.auth != null && 
+              exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+              get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'super_admin';
+    }
+
+    // 3. Check if user is a Manager for a specific campground
+    function isManager(campgroundId) {
+      return request.auth != null && (
+        isSuperAdmin() || 
+        (
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)/memberships/$(campgroundId)) &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)/memberships/$(campgroundId)).data.role == 'manager' &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)/memberships/$(campgroundId)).data.status == 'active'
+        )
+      );
+    }
+    
+    // 4. Role Check Helper
+    function getRole(campgroundId) {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)/memberships/$(campgroundId)).data.role;
+    }
+
+    // 5. Channel Access Helper
+    function canAccessChannel(postData) {
+      let channel = get(/databases/$(database)/documents/feed_channels/$(postData.channelId)).data;
+      let isPrivate = channel.get('isPrivate', false);
+      let members = channel.get('members', []);
+      return isPrivate == false ||
+             (request.auth.uid in members) ||
+             isManager(postData.campgroundId) ||
+             isSuperAdmin();
+    }
+
+    // 6. Campground Status Helpers
+    function getCampgroundStatus(campId) {
+      return get(/databases/$(database)/documents/campgrounds_registry/$(campId)).data.get('status', 'active');
+    }
+
+    function isCampgroundActive(campId) {
+      return getCampgroundStatus(campId) == 'active';
+    }
+
+
+    // --- COLLECTION RULES ---
+
+    // 0. CAMPGROUNDS CATALOG (Public discovery — pipeline-managed)
+    match /campgrounds/{campgroundId} {
+      // Public read — anyone can browse campgrounds
+      allow read: if true;
+      // No client writes — only Admin SDK (pipeline) can write
+      allow write: if false;
+
+      // Reviews subcollection
+      match /reviews/{reviewId} {
+        allow read: if true;
+        allow create: if request.auth != null &&
+                       request.resource.data.userId == request.auth.uid;
+        allow update, delete: if request.auth != null &&
+                               resource.data.userId == request.auth.uid;
+      }
+    }
+
+    // 0b. PIPELINE METADATA (Admin SDK only)
+    match /_pipeline_metadata/{docId} {
+      allow read, write: if false;
+    }
+
+    // 0c. SCRAPER CONFIGS (super_admin read via dashboard)
+    match /_scraper_configs/{spiderName} {
+      allow read: if isSuperAdmin();
+      allow write: if false;  // Only Cloud Functions write
+    }
+
+    // 0d. SCRAPER RUNS (super_admin read via dashboard)
+    match /_scraper_runs/{runId} {
+      allow read: if isSuperAdmin();
+      allow write: if false;  // Only Cloud Functions write
+    }
+
+    // 1. CAMPGROUNDS REGISTRY (UNCHANGED)
+    match /campgrounds_registry/{campId} {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+      
+      match /chiclets/{chicletId} {
+        allow read: if true;
+        allow write: if isManager(campId);
+      }
+    }
+
+    // 2. USERS & MEMBERSHIPS (UPDATED FOR SECURITY)
+    match /users/{userId} {
+      // READ: Allow any authenticated user to read user profiles
+      // Access control is enforced at the membership level - managers can only discover
+      // users through their campground's memberships query, so they can't access other
+      // campgrounds' user lists. User documents only contain profile info (name, email, photo).
+      allow read: if request.auth != null;
+
+      // CREATE: STRICT. Must have dateOfBirth.
+      // This is the "Gatekeeper" that stops Google Sign-In users from bypassing onboarding.
+      allow create: if request.auth != null && 
+                     request.auth.uid == userId && 
+                     isAdult(request.resource.data.dateOfBirth);
+      
+      // UPDATE: Only Self (if still Adult), Super Admin, or Manager (for rvInfo only).
+      // Managers can update the rvInfo field for users in their campground.
+      allow update: if request.auth != null && (
+        (request.auth.uid == userId && (
+          !('dateOfBirth' in request.resource.data) || isAdult(request.resource.data.dateOfBirth)
+        )) ||
+        isSuperAdmin() ||
+        // Manager can only update rvInfo field for users in their campground
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['rvInfo']))
+      );
+
+      // DELETE: Super Admin Only.
+      allow delete: if isSuperAdmin();
+  
+      // Subcollection: Memberships
+      match /memberships/{membershipId} {
+        allow read: if request.auth != null && (request.auth.uid == userId || isManager(membershipId));
+
+        // Allow users to self-create their CSU membership (auto-approve, no manager needed)
+        // Allow managers/super admins to create memberships when approving users
+        allow create: if request.auth != null && (
+          // CSU self-enrollment: must be 'csu' membership with guest role and active status
+          (request.auth.uid == userId &&
+           membershipId == 'csu' &&
+           request.resource.data.campgroundId == 'csu' &&
+           request.resource.data.role == 'guest' &&
+           request.resource.data.status == 'active') ||
+          // Managers/Super Admins can create memberships for their campground
+          isManager(membershipId)
+        );
+
+        // Existing write rule for non-create operations (update/delete)
+        allow update, delete: if request.auth != null && (request.auth.uid == userId || isManager(membershipId));
+      }
+    }
+
+
+    // Required for Super Admin "Users" Tab (collectionGroup memberships query) (UNCHANGED)
+    match /{path=**}/memberships/{membershipId} {
+      allow read: if request.auth != null && (
+        isSuperAdmin() || 
+        isManager(resource.data.campgroundId) || 
+        isManager(membershipId)
+      );
+    }
+
+    // 3. POSTS (UNCHANGED)
+    match /posts/{postId} {
+      allow read: if isSuperAdmin() ||
+                     (isMember(resource.data.campgroundId) && canAccessChannel(resource.data));
+      
+      allow create: if isSuperAdmin() ||
+                    (isMember(request.resource.data.campgroundId) &&
+                     getRole(request.resource.data.campgroundId) != 'guest' &&
+                     canAccessChannel(request.resource.data) &&
+                     isCampgroundActive(request.resource.data.campgroundId));
+      
+      allow update: if isSuperAdmin() || 
+                    (isMember(resource.data.campgroundId) && (
+                        request.auth.uid == resource.data.authorId || 
+                        getRole(resource.data.campgroundId) != 'guest'
+                    ));
+                    
+      allow delete: if isSuperAdmin() || 
+                    isManager(resource.data.campgroundId) || 
+                    (isMember(resource.data.campgroundId) && request.auth.uid == resource.data.authorId);
+    }
+
+    // 4. CHANNELS (UNCHANGED)
+    match /feed_channels/{channelId} {
+      allow read: if isSuperAdmin() || isMember(resource.data.campgroundId);
+      
+      allow write: if 
+          isSuperAdmin() || 
+          (request.resource != null ? isManager(request.resource.data.campgroundId) : isManager(resource.data.campgroundId)) ||
+          (
+            isMember(resource.data.campgroundId) && 
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pendingMembers', 'accessRequests']) &&
+            (
+              (
+                request.resource.data.pendingMembers.size() == resource.data.get('pendingMembers', []).size() + 1 &&
+                request.resource.data.pendingMembers.hasAll(resource.data.get('pendingMembers', [])) &&
+                request.resource.data.pendingMembers.hasAny([request.auth.uid]) &&
+                request.resource.data.accessRequests.diff(resource.data.get('accessRequests', {})).affectedKeys().hasOnly([request.auth.uid])
+              )
+              ||
+              (
+                request.resource.data.pendingMembers.size() == resource.data.get('pendingMembers', []).size() - 1 &&
+                resource.data.get('pendingMembers', []).hasAll(request.resource.data.pendingMembers) &&
+                !request.resource.data.pendingMembers.hasAny([request.auth.uid]) &&
+                !request.resource.data.accessRequests.keys().hasAny([request.auth.uid])
+              )
+            )
+          );
+    }
+
+    // 5. DIRECT MESSAGES (UNCHANGED)
+    match /direct_messages/{threadId} {
+       allow read, write: if request.auth != null && (
+         threadId.matches(request.auth.uid + '_.*') ||
+         isManager(resource.data.campgroundId) ||
+         (request.method == 'create' && isMember(request.resource.data.campgroundId))
+       );
+    }
+
+    // 6. GUEST PASSES (UPDATED)
+    match /guest_passes/{email} {
+      allow read: if request.auth != null;
+      // Allow Super Admins OR Managers of the specific campground to create/manage invites
+      allow write: if isSuperAdmin() || 
+                   (request.resource.data.campgroundId != null && isManager(request.resource.data.campgroundId)) ||
+                   (resource != null && isManager(resource.data.campgroundId));
+    }
+
+    // 7. MAIL (UNCHANGED)
+    match /mail/{mailId} {
+      allow create: if request.auth != null; 
+    }
+    
+    // 8. AVATARS LIBRARY (UNCHANGED)
+    match /avatars/{avatarId} {
+      allow read: if request.auth != null;
+      allow write: if isSuperAdmin();
+    }
+    
+    // 9. JOIN REQUESTS (UPDATED to allow User Cancellation)
+    match /join_requests/{requestId} {
+
+      // User can create (apply)
+      allow create: if request.auth != null &&
+                       request.resource.data.userId == request.auth.uid;
+
+      // Read: User, Manager, or Admin
+      allow read: if request.auth != null && (
+        resource.data.userId == request.auth.uid ||
+        isManager(resource.data.campgroundId) ||
+        isSuperAdmin()
+      );
+
+      // Delete: User (Cancel), Manager (Approve/Reject), or Admin
+      allow delete: if request.auth != null && (
+        resource.data.userId == request.auth.uid ||
+        isManager(resource.data.campgroundId) ||
+        isSuperAdmin()
+      );
+
+      // Write: Kept for compatibility, but Delete covers the main actions needed
+      allow write: if request.auth != null && (
+        isManager(resource.data.campgroundId) ||
+        isSuperAdmin()
+      );
+    }
+
+    // 10. POST REPLIES (Threaded Comments)
+    match /post_replies/{replyId} {
+      // Read: Same access as posts - members of the campground who can access the channel
+      allow read: if request.auth != null && (
+        isSuperAdmin() ||
+        isMember(resource.data.campgroundId)
+      );
+
+      // Create: Members with create_posts permission (same as posts)
+      allow create: if request.auth != null && (
+        isSuperAdmin() ||
+        (isMember(request.resource.data.campgroundId) &&
+         getRole(request.resource.data.campgroundId) != 'guest' &&
+         isCampgroundActive(request.resource.data.campgroundId))
+      );
+
+      // Delete: Author, Manager, or Super Admin
+      allow delete: if request.auth != null && (
+        isSuperAdmin() ||
+        isManager(resource.data.campgroundId) ||
+        request.auth.uid == resource.data.authorUid
+      );
+    }
+
+    // 11. FIREFLY GAMIFICATION - LOYALTY DATA
+    // Loyalty data for firefly rewards and medallion status
+    match /users/{userId}/loyalty/{campgroundId} {
+      // Read: User can read their own loyalty data, Managers can view for their campground
+      allow read: if request.auth != null && (
+        request.auth.uid == userId ||
+        isManager(campgroundId) ||
+        isSuperAdmin()
+      );
+
+      // Write: ONLY Cloud Functions can write
+      // Users and managers cannot directly modify loyalty data to prevent cheating
+      allow write: if false;
+
+      // Subcollection: Transaction history
+      match /history/{transactionId} {
+        // Read: User can read their own history, Managers can audit
+        allow read: if request.auth != null && (
+          request.auth.uid == userId ||
+          isManager(campgroundId) ||
+          isSuperAdmin()
+        );
+
+        // Write: ONLY Cloud Functions can write
+        allow write: if false;
+      }
+    }
+
+    // 12. FLAGGED POSTS - AI Moderation Queue
+    match /flagged_posts/{postId} {
+      // Read: Managers of campground or Super Admins
+      allow read: if request.auth != null && (
+        isManager(resource.data.campgroundId) ||
+        isSuperAdmin()
+      );
+
+      // Update: Managers can review (set reviewedBy, reviewedAt, reviewAction)
+      allow update: if request.auth != null && (
+        isManager(resource.data.campgroundId) ||
+        isSuperAdmin()
+      ) && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['reviewedBy', 'reviewedAt', 'reviewAction']);
+
+      // Delete: After review
+      allow delete: if request.auth != null && (
+        isManager(resource.data.campgroundId) ||
+        isSuperAdmin()
+      );
+
+      // Create: Only Cloud Functions (admin SDK)
+      allow create: if false;
+    }
+
+    // 13. POST REPORTS - User-submitted reports
+    match /post_reports/{reportId} {
+      // Read: Managers/Super Admins OR the reporter themselves (for duplicate checking)
+      allow read: if request.auth != null && (
+        isManager(resource.data.campgroundId) ||
+        isSuperAdmin() ||
+        resource.data.reporterId == request.auth.uid
+      );
+
+      // Create: Any authenticated member (cannot report own posts)
+      allow create: if request.auth != null &&
+        isMember(request.resource.data.campgroundId) &&
+        request.resource.data.reporterId == request.auth.uid &&
+        request.resource.data.postSnapshot.authorUid != request.auth.uid;
+
+      // Update: Managers can review (set status, reviewedBy, reviewedAt, reviewAction, reviewerName)
+      allow update: if request.auth != null && (
+        isManager(resource.data.campgroundId) ||
+        isSuperAdmin()
+      ) && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'reviewedBy', 'reviewerName', 'reviewedAt', 'reviewAction']);
+
+      // Delete: Only after review by manager/super_admin
+      allow delete: if request.auth != null && (
+        isManager(resource.data.campgroundId) ||
+        isSuperAdmin()
+      ) && resource.data.status == 'reviewed';
+    }
+
+    // 14. SEASONAL BILLING - Billing accounts for seasonal campers
+    // Document ID format: {campgroundId}_{odId}
+    match /seasonal_billing/{docId} {
+      // Read: User can read their own billing data, Managers can view for their campground
+      allow read: if request.auth != null && (
+        request.auth.uid == resource.data.odId ||
+        isManager(resource.data.campgroundId) ||
+        isSuperAdmin()
+      );
+
+      // Write: Only Managers of the campground (users cannot modify their billing data)
+      allow write: if request.auth != null && (
+        isManager(request.resource.data.campgroundId) ||
+        isSuperAdmin()
+      );
+
+      // Subcollection: Billing Years (2025, 2026, 2027, etc.)
+      match /billing_years/{year} {
+        allow read: if request.auth != null && (
+          request.auth.uid == get(/databases/$(database)/documents/seasonal_billing/$(docId)).data.odId ||
+          isManager(get(/databases/$(database)/documents/seasonal_billing/$(docId)).data.campgroundId) ||
+          isSuperAdmin()
+        );
+
+        allow write: if request.auth != null && (
+          isManager(get(/databases/$(database)/documents/seasonal_billing/$(docId)).data.campgroundId) ||
+          isSuperAdmin()
+        );
+
+        // Season Payments (site_rate, winter_storage, tax charges)
+        match /season_payments/{paymentId} {
+          allow read: if request.auth != null && (
+            request.auth.uid == get(/databases/$(database)/documents/seasonal_billing/$(docId)).data.odId ||
+            isManager(get(/databases/$(database)/documents/seasonal_billing/$(docId)).data.campgroundId) ||
+            isSuperAdmin()
+          );
+
+          allow write: if request.auth != null && (
+            isManager(get(/databases/$(database)/documents/seasonal_billing/$(docId)).data.campgroundId) ||
+            isSuperAdmin()
+          );
+        }
+
+        // Electric Bills (monthly meter readings)
+        match /electric_bills/{billId} {
+          allow read: if request.auth != null && (
+            request.auth.uid == get(/databases/$(database)/documents/seasonal_billing/$(docId)).data.odId ||
+            isManager(get(/databases/$(database)/documents/seasonal_billing/$(docId)).data.campgroundId) ||
+            isSuperAdmin()
+          );
+
+          allow write: if request.auth != null && (
+            isManager(get(/databases/$(database)/documents/seasonal_billing/$(docId)).data.campgroundId) ||
+            isSuperAdmin()
+          );
+        }
+
+        // Misc Purchases (propane, plumbing, etc.)
+        match /misc_purchases/{purchaseId} {
+          allow read: if request.auth != null && (
+            request.auth.uid == get(/databases/$(database)/documents/seasonal_billing/$(docId)).data.odId ||
+            isManager(get(/databases/$(database)/documents/seasonal_billing/$(docId)).data.campgroundId) ||
+            isSuperAdmin()
+          );
+
+          allow write: if request.auth != null && (
+            isManager(get(/databases/$(database)/documents/seasonal_billing/$(docId)).data.campgroundId) ||
+            isSuperAdmin()
+          );
+        }
+      }
+    }
+
+    // 15. SAVED PARKS - User's saved national parks (per-user subcollection)
+    match /users/{userId}/saved_parks/{parkId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // 16. RV PROFILES - User's identified RV vehicles
+    match /rvProfiles/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+
+      match /vehicles/{vehicleId} {
+        allow read: if request.auth != null && (
+          request.auth.uid == userId || isSuperAdmin()
+        );
+        allow create, update: if request.auth != null && request.auth.uid == userId;
+        allow delete: if request.auth != null && (
+          request.auth.uid == userId || isSuperAdmin()
+        );
+      }
+    }
+
+    // 17. RV DATABASE - Anonymized verified vehicle specs (Cloud Function writes, Super Admin CRUD)
+    match /rvDatabase/{docId} {
+      allow read, write: if request.auth != null && isSuperAdmin();
+    }
+
+    // 18. RV KNOWLEDGE BASE - Ask Mike Q&A logs (Cloud Function writes, Super Admin CRUD)
+    match /rvKnowledgeBase/{docId} {
+      allow read, write: if request.auth != null && isSuperAdmin();
+
+      match /items/{itemId} {
+        allow read, write: if request.auth != null && isSuperAdmin();
+      }
+    }
+
+    // 19. TRADING POST SETTINGS - Platform-wide marketplace configuration
+    match /trading_post_settings/{configId} {
+      // Read: Any authenticated user (need to know pricing, feature status)
+      allow read: if request.auth != null;
+
+      // Write: Only Super Admin can modify settings
+      allow write: if isSuperAdmin();
+    }
+
+    // 16. TRADING POST LISTINGS - Global marketplace listings
+    match /trading_post_listings/{listingId} {
+      // Helper: Check if user owns the listing
+      function isListingOwner() {
+        return request.auth.uid == resource.data.sellerId;
+      }
+
+      // Read: Any authenticated user (global marketplace)
+      allow read: if request.auth != null;
+
+      // Create: Any authenticated user
+      allow create: if request.auth != null &&
+        request.resource.data.sellerId == request.auth.uid;
+
+      // Update: Owner (limited fields), Super Admin (full access), or any user (savedBy only)
+      allow update: if request.auth != null && (
+        isSuperAdmin() ||
+        (isListingOwner() &&
+         !request.resource.data.diff(resource.data).affectedKeys().hasAny(['sellerId', 'sellerName', 'createdAt'])) ||
+        // Allow any authenticated user to update only the savedBy field (for favorites)
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['savedBy'])
+      );
+
+      // Delete: Owner or Super Admin
+      allow delete: if request.auth != null && (
+        isListingOwner() ||
+        isSuperAdmin()
+      );
+    }
+
+    // 17. TRADING POST PAYMENTS - Payment records for listing extensions
+    match /trading_post_payments/{paymentId} {
+      // Read: Owner of payment or Super Admin
+      allow read: if request.auth != null && (
+        resource.data.userId == request.auth.uid ||
+        isSuperAdmin()
+      );
+
+      // Write: Only Cloud Functions (via Admin SDK) - users cannot create payment records directly
+      allow write: if false;
+    }
+
+    // 18. TRADING POST MESSAGES - Buyer-seller communication threads
+    // Thread ID format: {listingId}_{buyerId}_{sellerId}
+    match /trading_post_messages/{threadId} {
+      // Helper: Check if user is participant in thread (for existing documents)
+      function isThreadParticipant() {
+        return request.auth.uid == resource.data.buyerId ||
+               request.auth.uid == resource.data.sellerId;
+      }
+
+      // Helper: Check if user's UID appears in the threadId (for non-existent docs)
+      // ThreadId format: listingId_buyerId_sellerId
+      function isUserInThreadId() {
+        return threadId.matches('.*_' + request.auth.uid + '_.*') ||
+               threadId.matches('.*_.*_' + request.auth.uid);
+      }
+
+      // Read: Thread participants, users whose UID is in threadId, or Super Admin
+      // Note: isUserInThreadId() allows reading even if doc doesn't exist yet (for onSnapshot)
+      allow read: if request.auth != null && (
+        (resource != null && isThreadParticipant()) ||
+        isUserInThreadId() ||
+        isSuperAdmin()
+      );
+
+      // Create: Any authenticated user can initiate a conversation (as buyer)
+      // Must be creating with themselves as the buyer
+      allow create: if request.auth != null &&
+        request.resource.data.buyerId == request.auth.uid;
+
+      // Update: Only thread participants can update (add messages)
+      allow update: if request.auth != null && (
+        isThreadParticipant() ||
+        isSuperAdmin()
+      );
+
+      // Delete: Super Admin only
+      allow delete: if isSuperAdmin();
+    }
+
+    // ===== SPARKS FEATURE =====
+
+    // 19. SPARKS PROFILES - User dating/social profiles
+    match /sparks_profiles/{userId} {
+      // Read: Any authenticated user (discovery feed)
+      allow read: if request.auth != null;
+
+      // Create/Update: Only the profile owner
+      allow create, update: if request.auth != null && request.auth.uid == userId;
+
+      // Delete: Owner or Super Admin
+      allow delete: if request.auth != null && (
+        request.auth.uid == userId || isSuperAdmin()
+      );
+    }
+
+    // 20. SPARKS EVENTS - Bonfires, Small Campfires, Group Outings
+    match /sparks_events/{eventId} {
+      // Read: Any authenticated user (browse events at campground)
+      allow read: if request.auth != null;
+
+      // Create: Authenticated user (host must be themselves)
+      allow create: if request.auth != null &&
+        request.resource.data.hostId == request.auth.uid;
+
+      // Update: Host (manage attendees), or Super Admin (approve/reject)
+      allow update: if request.auth != null && (
+        request.auth.uid == resource.data.hostId ||
+        isSuperAdmin()
+      );
+
+      // Delete: Host or Super Admin
+      allow delete: if request.auth != null && (
+        request.auth.uid == resource.data.hostId || isSuperAdmin()
+      );
+    }
+
+    // 21. SPARKS MESSAGES - Chat threads between users
+    // Thread ID format: sorted {userId1}_{userId2}
+    match /sparks_messages/{threadId} {
+      // Helper: Check if user is a participant
+      function isSparksParticipant() {
+        return request.auth.uid in resource.data.participants;
+      }
+
+      // Helper: Check if user's UID is in threadId (for non-existent docs / onSnapshot)
+      function isUserInSparksThreadId() {
+        return threadId.matches(request.auth.uid + '_.*') ||
+               threadId.matches('.*_' + request.auth.uid);
+      }
+
+      // Read: Participants or Super Admin
+      allow read: if request.auth != null && (
+        (resource != null && isSparksParticipant()) ||
+        isUserInSparksThreadId() ||
+        isSuperAdmin()
+      );
+
+      // Create: Authenticated user (must be a participant)
+      allow create: if request.auth != null &&
+        request.auth.uid in request.resource.data.participants;
+
+      // Update: Participants only (add messages)
+      allow update: if request.auth != null && (
+        isSparksParticipant() || isSuperAdmin()
+      );
+
+      // Delete: Super Admin only
+      allow delete: if isSuperAdmin();
+    }
+
+    // 22. SPARKS SUBSCRIPTIONS - Payment subscription records
+    match /sparks_subscriptions/{userId} {
+      // Read: Owner or Super Admin
+      allow read: if request.auth != null && (
+        request.auth.uid == userId || isSuperAdmin()
+      );
+
+      // Write: Only Cloud Functions (via Admin SDK)
+      allow write: if false;
+    }
+
+    // 23. SPARKS SMOKE SIGNALS - Real-time location broadcasts during events
+    match /sparks_smoke_signals/{signalId} {
+      // Read: Any authenticated user (event attendees filter client-side)
+      allow read: if request.auth != null;
+
+      // Create: Authenticated user (must be themselves)
+      allow create: if request.auth != null &&
+        request.resource.data.userId == request.auth.uid;
+
+      // Update: Owner only
+      allow update: if request.auth != null &&
+        request.auth.uid == resource.data.userId;
+
+      // Delete: Owner or Super Admin (cleanup)
+      allow delete: if request.auth != null && (
+        request.auth.uid == resource.data.userId || isSuperAdmin()
+      );
+    }
+
+    // 24. SPARKS LANTERN REQUESTS - Open invitations for activities
+    match /sparks_lanterns/{lanternId} {
+      // Read: Any authenticated user
+      allow read: if request.auth != null;
+
+      // Create: Authenticated user (must be themselves)
+      allow create: if request.auth != null &&
+        request.resource.data.userId == request.auth.uid;
+
+      // Update: Owner (manage responses, mark fulfilled)
+      allow update: if request.auth != null && (
+        request.auth.uid == resource.data.userId || isSuperAdmin()
+      );
+
+      // Delete: Owner or Super Admin
+      allow delete: if request.auth != null && (
+        request.auth.uid == resource.data.userId || isSuperAdmin()
+      );
+    }
+
+    // 25. SPARKS REPORTS - User reports for moderation
+    match /sparks_reports/{reportId} {
+      // Read: Reporter or Super Admin
+      allow read: if request.auth != null && (
+        resource.data.reporterId == request.auth.uid || isSuperAdmin()
+      );
+
+      // Create: Authenticated user (cannot report self)
+      allow create: if request.auth != null &&
+        request.resource.data.reporterId == request.auth.uid &&
+        request.resource.data.reportedUserId != request.auth.uid;
+
+      // Update: Super Admin only (review action)
+      allow update: if isSuperAdmin();
+
+      // Delete: Super Admin only
+      allow delete: if isSuperAdmin();
+    }
+
+    // ===== SPARKS PHASE 6 & 7 =====
+
+    // 26. SPARKS BLOCKS - Block/Mute between users
+    match /sparks_blocks/{blockId} {
+      // Read: The blocker or the blocked user (to check if blocked by someone)
+      allow read: if request.auth != null && (
+        resource.data.blockerId == request.auth.uid ||
+        resource.data.blockedId == request.auth.uid ||
+        isSuperAdmin()
+      );
+
+      // Create: Authenticated user (must be the blocker)
+      allow create: if request.auth != null &&
+        request.resource.data.blockerId == request.auth.uid &&
+        request.resource.data.blockedId != request.auth.uid;
+
+      // Delete: The blocker can unblock
+      allow delete: if request.auth != null && (
+        resource.data.blockerId == request.auth.uid || isSuperAdmin()
+      );
+
+      // Update: Blocker can change type
+      allow update: if request.auth != null &&
+        resource.data.blockerId == request.auth.uid;
+    }
+
+    // 27. SPARKS SAFETY CHECK-INS - Safety timers for meetups
+    match /sparks_safety_checkins/{checkinId} {
+      // Read: Owner or Super Admin
+      allow read: if request.auth != null && (
+        resource.data.userId == request.auth.uid || isSuperAdmin()
+      );
+
+      // Create: Authenticated user (must be themselves)
+      allow create: if request.auth != null &&
+        request.resource.data.userId == request.auth.uid;
+
+      // Update: Owner (mark safe, extend timer)
+      allow update: if request.auth != null &&
+        resource.data.userId == request.auth.uid;
+
+      // Delete: Owner (end check-in) or Super Admin
+      allow delete: if request.auth != null && (
+        resource.data.userId == request.auth.uid || isSuperAdmin()
+      );
+    }
+
+    // 28. SPARKS BEACONS - Happy Hour spontaneous invites
+    match /sparks_beacons/{beaconId} {
+      // Read: Any authenticated user
+      allow read: if request.auth != null;
+
+      // Create: Authenticated user (must be themselves)
+      allow create: if request.auth != null &&
+        request.resource.data.userId == request.auth.uid;
+
+      // Update: Owner only
+      allow update: if request.auth != null &&
+        resource.data.userId == request.auth.uid;
+
+      // Delete: Owner or Super Admin
+      allow delete: if request.auth != null && (
+        resource.data.userId == request.auth.uid || isSuperAdmin()
+      );
+    }
+
+    // 29. SPARKS KINDLES - Like/match system
+    match /sparks_kindles/{kindleId} {
+      // Read: Either user involved or Super Admin
+      allow read: if request.auth != null && (
+        resource.data.fromUserId == request.auth.uid ||
+        resource.data.toUserId == request.auth.uid ||
+        isSuperAdmin()
+      );
+
+      // Create: Authenticated user (must be the sender)
+      allow create: if request.auth != null &&
+        request.resource.data.fromUserId == request.auth.uid &&
+        request.resource.data.toUserId != request.auth.uid;
+
+      // Delete: The sender can unkindled
+      allow delete: if request.auth != null && (
+        resource.data.fromUserId == request.auth.uid || isSuperAdmin()
+      );
+
+      // No updates needed
+      allow update: if false;
+    }
+
+    // 30. SPARKS DAILY SPARKS - Daily profile suggestions
+    match /sparks_daily_sparks/{sparkId} {
+      // Read: Owner only
+      allow read: if request.auth != null &&
+        resource.data.userId == request.auth.uid;
+
+      // Create: Owner only
+      allow create: if request.auth != null &&
+        request.resource.data.userId == request.auth.uid;
+
+      // Update: Owner only (dismiss)
+      allow update: if request.auth != null &&
+        resource.data.userId == request.auth.uid;
+
+      // Delete: Owner or Super Admin
+      allow delete: if request.auth != null && (
+        resource.data.userId == request.auth.uid || isSuperAdmin()
+      );
+    }
+  }
+}
