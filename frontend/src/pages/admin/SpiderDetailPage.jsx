@@ -25,31 +25,49 @@ const STATUS_COLORS = {
 // Run Parameters Panel — shown before triggering
 // ---------------------------------------------------------------------------
 function RunParametersPanel({ config, onRun, running }) {
-  const [targetStates, setTargetStates] = useState(
-    config.targetStates?.join(', ') || config.states?.join(', ') || ''
-  );
+  const [selectedStates, setSelectedStates] = useState(() => {
+    const initial = config.targetStates || config.states || [];
+    return new Set(initial.map((s) => s.toUpperCase()));
+  });
   const [itemLimit, setItemLimit] = useState(config.itemLimit || config.item_limit || 100);
-  const [showRegions, setShowRegions] = useState(false);
+  const [dropdownOpen, setDropdownOpen] = useState(false);
 
   function handleRun() {
-    const states = targetStates
-      .split(',')
-      .map((s) => s.trim().toUpperCase())
-      .filter((s) => US_STATES[s]);
-
+    const states = [...selectedStates].filter((s) => US_STATES[s]);
     onRun({
       targetStates: states.length > 0 ? states : null,
       itemLimit: parseInt(itemLimit, 10) || null,
     });
   }
 
-  function addRegion(regionStates) {
-    const current = targetStates
-      .split(',')
-      .map((s) => s.trim().toUpperCase())
-      .filter(Boolean);
-    const merged = [...new Set([...current, ...regionStates])];
-    setTargetStates(merged.join(', '));
+  function toggleState(code) {
+    setSelectedStates((prev) => {
+      const next = new Set(prev);
+      if (next.has(code)) next.delete(code);
+      else next.add(code);
+      return next;
+    });
+  }
+
+  function toggleRegion(regionStates) {
+    setSelectedStates((prev) => {
+      const next = new Set(prev);
+      const allSelected = regionStates.every((s) => next.has(s));
+      if (allSelected) {
+        regionStates.forEach((s) => next.delete(s));
+      } else {
+        regionStates.forEach((s) => next.add(s));
+      }
+      return next;
+    });
+  }
+
+  function selectAll() {
+    setSelectedStates(new Set(Object.keys(US_STATES)));
+  }
+
+  function clearAll() {
+    setSelectedStates(new Set());
   }
 
   return (
@@ -61,52 +79,136 @@ function RunParametersPanel({ config, onRun, running }) {
       </p>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+        {/* State selector */}
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">
-            Target States (comma-separated)
+            Target States
           </label>
-          <input
-            type="text"
-            value={targetStates}
-            onChange={(e) => setTargetStates(e.target.value)}
-            placeholder="CA, OR, WA"
-            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-campfire-500 focus:border-campfire-500 outline-none"
-          />
-          <div className="mt-2 flex flex-wrap gap-1">
-            <button
-              type="button"
-              onClick={() => setShowRegions(!showRegions)}
-              className="text-xs text-campfire-600 hover:text-campfire-800 underline"
+
+          {/* Dropdown trigger */}
+          <button
+            type="button"
+            onClick={() => setDropdownOpen(!dropdownOpen)}
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-left bg-white hover:border-campfire-400 focus:ring-2 focus:ring-campfire-500 focus:border-campfire-500 outline-none flex items-center justify-between"
+          >
+            <span className={selectedStates.size === 0 ? 'text-gray-400' : 'text-gray-900'}>
+              {selectedStates.size === 0
+                ? 'All states (no filter)'
+                : selectedStates.size === Object.keys(US_STATES).length
+                ? 'All 50 states selected'
+                : `${selectedStates.size} state${selectedStates.size !== 1 ? 's' : ''} selected`}
+            </span>
+            <svg
+              className={`h-4 w-4 text-gray-400 transition-transform ${dropdownOpen ? 'rotate-180' : ''}`}
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
             >
-              {showRegions ? 'Hide regions' : 'Add by region'}
-            </button>
-            {targetStates && (
-              <button
-                type="button"
-                onClick={() => setTargetStates('')}
-                className="text-xs text-red-500 hover:text-red-700 underline ml-2"
-              >
-                Clear all
-              </button>
-            )}
-          </div>
-          {showRegions && (
-            <div className="mt-2 flex flex-wrap gap-1">
-              {Object.entries(REGIONS).map(([region, states]) => (
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+
+          {/* Dropdown panel */}
+          {dropdownOpen && (
+            <div className="mt-1 border border-gray-200 rounded-lg bg-white shadow-lg max-h-80 overflow-y-auto z-10 relative">
+              {/* Select all / Clear all */}
+              <div className="sticky top-0 bg-white border-b border-gray-100 px-3 py-2 flex gap-2">
                 <button
-                  key={region}
                   type="button"
-                  onClick={() => addRegion(states)}
-                  className="text-xs px-2 py-1 rounded bg-gray-100 hover:bg-campfire-100 text-gray-700 hover:text-campfire-700 transition-colors"
+                  onClick={selectAll}
+                  className="text-xs px-2 py-1 rounded bg-campfire-100 text-campfire-700 hover:bg-campfire-200 transition-colors"
                 >
-                  {region} ({states.length})
+                  Select All
                 </button>
+                <button
+                  type="button"
+                  onClick={clearAll}
+                  className="text-xs px-2 py-1 rounded bg-gray-100 text-gray-700 hover:bg-gray-200 transition-colors"
+                >
+                  Clear All
+                </button>
+              </div>
+
+              {/* Regions with state checkboxes */}
+              {Object.entries(REGIONS).map(([region, states]) => {
+                const selectedInRegion = states.filter((s) => selectedStates.has(s)).length;
+                const allInRegion = selectedInRegion === states.length;
+
+                return (
+                  <div key={region} className="border-b border-gray-50 last:border-0">
+                    {/* Region header checkbox */}
+                    <label className="flex items-center gap-2 px-3 py-2 bg-gray-50 cursor-pointer hover:bg-gray-100">
+                      <input
+                        type="checkbox"
+                        checked={allInRegion}
+                        onChange={() => toggleRegion(states)}
+                        className="rounded border-gray-300 text-campfire-500 focus:ring-campfire-500"
+                        ref={(el) => {
+                          if (el) el.indeterminate = selectedInRegion > 0 && !allInRegion;
+                        }}
+                      />
+                      <span className="text-xs font-semibold text-gray-700 flex-1">
+                        {region}
+                      </span>
+                      <span className="text-xs text-gray-400">
+                        {selectedInRegion}/{states.length}
+                      </span>
+                    </label>
+
+                    {/* Individual state checkboxes */}
+                    <div className="flex flex-wrap gap-x-0 px-2 py-1.5">
+                      {states.map((code) => (
+                        <label
+                          key={code}
+                          className="flex items-center gap-1 px-1.5 py-0.5 cursor-pointer hover:bg-campfire-50 rounded text-xs w-[calc(50%)]"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={selectedStates.has(code)}
+                            onChange={() => toggleState(code)}
+                            className="rounded border-gray-300 text-campfire-500 focus:ring-campfire-500 h-3.5 w-3.5"
+                          />
+                          <span className="text-gray-700">{code}</span>
+                          <span className="text-gray-400 truncate">{US_STATES[code]}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Selected state badges */}
+          {selectedStates.size > 0 && selectedStates.size <= 10 && (
+            <div className="mt-2 flex flex-wrap gap-1">
+              {[...selectedStates].sort().map((code) => (
+                <span
+                  key={code}
+                  className="inline-flex items-center gap-0.5 text-xs px-1.5 py-0.5 rounded-full bg-campfire-100 text-campfire-700"
+                >
+                  {code}
+                  <button
+                    type="button"
+                    onClick={() => toggleState(code)}
+                    className="hover:text-campfire-900"
+                  >
+                    &times;
+                  </button>
+                </span>
               ))}
             </div>
           )}
-          {targetStates && (
+          {selectedStates.size > 10 && (
             <p className="mt-2 text-xs text-gray-500">
-              {targetStates.split(',').filter((s) => US_STATES[s.trim().toUpperCase()]).length} valid state(s)
+              {selectedStates.size} states selected
+              <button
+                type="button"
+                onClick={clearAll}
+                className="text-red-500 hover:text-red-700 underline ml-2"
+              >
+                Clear all
+              </button>
             </p>
           )}
         </div>
@@ -129,7 +231,7 @@ function RunParametersPanel({ config, onRun, running }) {
         </div>
       </div>
 
-      {!targetStates.trim() && (
+      {selectedStates.size === 0 && (
         <div className="mb-4 p-3 bg-yellow-50 border border-yellow-200 rounded-lg text-sm text-yellow-800">
           Warning: No state filter set. This will attempt to pull ALL data from the source.
         </div>
@@ -144,7 +246,7 @@ function RunParametersPanel({ config, onRun, running }) {
         {running ? (
           <>
             <LoadingSpinner size="sm" />
-            Starting...
+            Running...
           </>
         ) : (
           <>
@@ -425,7 +527,15 @@ export default function SpiderDetailPage() {
 
       {/* Run history table */}
       <div>
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">Run History</h2>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-semibold text-gray-900">Run History</h2>
+          <Link
+            to={`/admin/inventory?source=${name}`}
+            className="text-sm text-campfire-600 hover:text-campfire-800 hover:underline"
+          >
+            View all {displayName} data &rarr;
+          </Link>
+        </div>
         {completedRuns.length === 0 ? (
           <p className="text-gray-500 text-center py-8">No completed runs recorded.</p>
         ) : (
@@ -438,13 +548,17 @@ export default function SpiderDetailPage() {
                   <th className="pb-3 pr-4 font-medium">Status</th>
                   <th className="pb-3 pr-4 font-medium">Found</th>
                   <th className="pb-3 pr-4 font-medium">Loaded</th>
-                  <th className="pb-3 font-medium">Errors</th>
+                  <th className="pb-3 pr-4 font-medium">Errors</th>
+                  <th className="pb-3 pr-4 font-medium">Duration</th>
+                  <th className="pb-3 font-medium">Results</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100">
                 {completedRuns.map((run) => {
                   const states = run.config?.targetStates;
                   const stats = run.stats || {};
+                  const loaded = stats.itemsLoaded ?? run.items_loaded ?? 0;
+                  const duration = stats.duration;
                   return (
                     <tr key={run.id} className="text-gray-700">
                       <td className="py-3 pr-4">{formatTimestamp(run.startedAt)}</td>
@@ -461,8 +575,29 @@ export default function SpiderDetailPage() {
                         </span>
                       </td>
                       <td className="py-3 pr-4">{stats.itemsFound ?? run.items_found ?? '-'}</td>
-                      <td className="py-3 pr-4">{stats.itemsLoaded ?? run.items_loaded ?? '-'}</td>
-                      <td className="py-3">{stats.errors ?? run.errors ?? 0}</td>
+                      <td className="py-3 pr-4">{loaded}</td>
+                      <td className="py-3 pr-4">{stats.errors ?? run.errors ?? 0}</td>
+                      <td className="py-3 pr-4 text-xs text-gray-500">
+                        {duration ? `${duration}s` : '-'}
+                      </td>
+                      <td className="py-3">
+                        {run.status === 'completed' && loaded > 0 ? (
+                          <Link
+                            to={`/admin/inventory?source=${name}${
+                              states && states.length === 1 ? `&state=${states[0]}` : ''
+                            }`}
+                            className="text-xs text-campfire-600 hover:text-campfire-800 hover:underline"
+                          >
+                            View {loaded}
+                          </Link>
+                        ) : run.status === 'failed' && run.errorLog?.length > 0 ? (
+                          <span className="text-xs text-red-500" title={run.errorLog[0]}>
+                            Error
+                          </span>
+                        ) : (
+                          <span className="text-xs text-gray-400">-</span>
+                        )}
+                      </td>
                     </tr>
                   );
                 })}

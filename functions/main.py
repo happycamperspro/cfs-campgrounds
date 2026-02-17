@@ -8,8 +8,10 @@ Provides:
 """
 
 import json
+import logging
+import os
+import time
 from datetime import datetime, timezone
-from functools import wraps
 
 from firebase_functions import https_fn, scheduler_fn
 from firebase_functions.options import set_global_options, CorsOptions
@@ -20,6 +22,8 @@ set_global_options(max_instances=10)
 _cors = CorsOptions(cors_origins="*", cors_methods=["GET", "POST", "OPTIONS"])
 
 app = initialize_app()
+
+logger = logging.getLogger(__name__)
 
 # Lazy Firestore client — avoids blocking module load during deploy analysis
 _db = None
@@ -90,12 +94,199 @@ API_SOURCES = ["recreation_gov", "nps"]
 
 
 # ---------------------------------------------------------------------------
+# Firestore batch helpers
+# ---------------------------------------------------------------------------
+
+def _remove_none_values(d):
+    """Recursively remove keys whose values are None from a dict."""
+    if not isinstance(d, dict):
+        return d
+    cleaned = {}
+    for key, value in d.items():
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            nested = _remove_none_values(value)
+            if nested:
+                cleaned[key] = nested
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
+def _batch_upsert_campgrounds(records, run_ref=None):
+    """Batch upsert normalized campground records to the campgrounds collection."""
+    db = _get_db()
+    collection_ref = db.collection("campgrounds")
+    batch_size = 500
+    loaded = 0
+
+    for i in range(0, len(records), batch_size):
+        batch_slice = records[i : i + batch_size]
+        batch = db.batch()
+        ops = 0
+
+        for record in batch_slice:
+            record = dict(record)  # shallow copy
+            doc_id = record.pop("_doc_id", None)
+            if not doc_id:
+                continue
+            cleaned = _remove_none_values(record)
+            doc_ref = collection_ref.document(doc_id)
+            batch.set(doc_ref, cleaned, merge=True)
+            ops += 1
+
+        if ops > 0:
+            batch.commit()
+            loaded += ops
+
+        # Update progress in the run document
+        if run_ref:
+            run_ref.update({"stats.itemsLoaded": loaded})
+
+    return loaded
+
+
+# ---------------------------------------------------------------------------
+# API source execution
+# ---------------------------------------------------------------------------
+
+def _execute_api_source(spider_name, target_states, item_limit, run_ref):
+    """Fetch campgrounds from an API source, normalize, and load to Firestore.
+
+    Returns (stats_dict, error_log_list).
+    """
+    import requests as http
+    from normalizer import normalize_nps, normalize_recreation_gov
+
+    start_time = time.time()
+    all_records = []
+    errors = 0
+    error_log = []
+
+    if spider_name == "nps":
+        api_key = os.environ.get("NPS_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("NPS_API_KEY environment variable is not set")
+
+        base_url = "https://developer.nps.gov/api/v1"
+        session = http.Session()
+        session.headers.update({"X-Api-Key": api_key, "Accept": "application/json"})
+
+        offset = 0
+        page_size = 50
+        params = {}
+        if target_states:
+            params["stateCode"] = ",".join(s.upper() for s in target_states)
+
+        while True:
+            page_params = {**params, "start": offset, "limit": page_size}
+            resp = session.get(
+                f"{base_url}/campgrounds", params=page_params, timeout=30
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            records = data.get("data", [])
+            if not records:
+                break
+
+            for raw in records:
+                try:
+                    all_records.append(normalize_nps(raw))
+                except Exception as e:
+                    errors += 1
+                    error_log.append(f"NPS normalize error: {e}")
+
+            # Update progress
+            run_ref.update({"stats.itemsFound": len(all_records)})
+
+            if item_limit and len(all_records) >= item_limit:
+                all_records = all_records[:item_limit]
+                break
+
+            total = int(data.get("total", 0))
+            offset += page_size
+            if offset >= total:
+                break
+
+            time.sleep(1.0)  # Rate limit
+
+    elif spider_name == "recreation_gov":
+        api_key = os.environ.get("RECREATION_GOV_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("RECREATION_GOV_API_KEY environment variable is not set")
+
+        base_url = "https://ridb.recreation.gov/api/v1"
+        session = http.Session()
+        session.headers.update({"apikey": api_key, "Accept": "application/json"})
+
+        offset = 0
+        page_size = 50
+        params = {"activity": "CAMPING", "full": "true"}
+        if target_states:
+            params["state"] = ",".join(s.upper() for s in target_states)
+
+        while True:
+            page_params = {**params, "offset": offset, "limit": page_size}
+            resp = session.get(
+                f"{base_url}/facilities", params=page_params, timeout=30
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            records = data.get("RECDATA", [])
+            if not records:
+                break
+
+            for raw in records:
+                try:
+                    all_records.append(normalize_recreation_gov(raw))
+                except Exception as e:
+                    errors += 1
+                    error_log.append(f"RecGov normalize error: {e}")
+
+            # Update progress
+            run_ref.update({"stats.itemsFound": len(all_records)})
+
+            if item_limit and len(all_records) >= item_limit:
+                all_records = all_records[:item_limit]
+                break
+
+            total_count = (
+                data.get("METADATA", {}).get("RESULTS", {}).get("TOTAL_COUNT", 0)
+            )
+            total = int(total_count)
+            offset += page_size
+            if offset >= total:
+                break
+
+            time.sleep(0.5)  # Rate limit
+
+    # Load to Firestore
+    loaded = _batch_upsert_campgrounds(all_records, run_ref)
+    elapsed = time.time() - start_time
+
+    stats = {
+        "itemsFound": len(all_records),
+        "itemsLoaded": loaded,
+        "errors": errors,
+        "duration": round(elapsed, 1),
+    }
+    return stats, error_log
+
+
+# ---------------------------------------------------------------------------
 # 1. trigger_scraper — start a spider / API source run
 # ---------------------------------------------------------------------------
 
-@https_fn.on_request(cors=_cors)
+@https_fn.on_request(cors=_cors, timeout_sec=540, memory=512)
 def trigger_scraper(req: https_fn.Request) -> https_fn.Response:
     """Start a scraper run.
+
+    For API sources (nps, recreation_gov): executes the fetch inline and
+    returns when complete.  For Scrapy-based spiders: not yet supported
+    from Cloud Functions.
 
     Body JSON:
         spiderName (str): one of ALL_SOURCES
@@ -112,39 +303,109 @@ def trigger_scraper(req: https_fn.Request) -> https_fn.Response:
     if spider_name not in ALL_SOURCES:
         return _error(400, f"Invalid source name. Must be one of: {ALL_SOURCES}")
 
+    target_states = body.get("targetStates")
+    item_limit = body.get("itemLimit")
+    if item_limit:
+        try:
+            item_limit = int(item_limit)
+        except (ValueError, TypeError):
+            item_limit = None
+
     now = datetime.now(timezone.utc)
     run_ref = _get_db().collection("_scraper_runs").document()
-    run_data = {
-        "spiderName": spider_name,
-        "status": "pending",
-        "startedAt": now,
-        "completedAt": None,
-        "triggeredBy": decoded["uid"],
-        "config": {
-            "targetStates": body.get("targetStates"),
-            "itemLimit": body.get("itemLimit"),
-        },
-        "stats": {
-            "itemsFound": 0,
-            "itemsLoaded": 0,
-            "errors": 0,
-            "duration": 0,
-        },
-        "errorLog": [],
-    }
-    run_ref.set(run_data)
-
-    # Update the source config with last triggered info
     config_ref = _get_db().collection("_scraper_configs").document(spider_name)
-    config_ref.set(
-        {
-            "lastRunAt": now,
-            "lastRunStatus": "running",
-        },
-        merge=True,
-    )
 
-    return _ok({"runId": run_ref.id, "status": "pending"})
+    if spider_name in API_SOURCES:
+        # ---- Execute API source inline ----
+        run_ref.set({
+            "spiderName": spider_name,
+            "status": "running",
+            "startedAt": now,
+            "completedAt": None,
+            "triggeredBy": decoded["uid"],
+            "config": {
+                "targetStates": target_states,
+                "itemLimit": item_limit,
+            },
+            "stats": {
+                "itemsFound": 0,
+                "itemsLoaded": 0,
+                "errors": 0,
+                "duration": 0,
+            },
+            "errorLog": [],
+        })
+        config_ref.set(
+            {"lastRunAt": now, "lastRunStatus": "running"}, merge=True
+        )
+
+        try:
+            stats, error_log = _execute_api_source(
+                spider_name, target_states, item_limit, run_ref
+            )
+            completed_at = datetime.now(timezone.utc)
+            run_ref.update({
+                "status": "completed",
+                "completedAt": completed_at,
+                "stats": stats,
+                "errorLog": error_log[:50],
+            })
+            config_ref.update({"lastRunStatus": "completed"})
+
+            return _ok({
+                "runId": run_ref.id,
+                "status": "completed",
+                "stats": stats,
+            })
+
+        except Exception as e:
+            logger.exception("API source execution failed: %s", e)
+            completed_at = datetime.now(timezone.utc)
+            run_ref.update({
+                "status": "failed",
+                "completedAt": completed_at,
+                "errorLog": firestore.ArrayUnion([str(e)]),
+            })
+            config_ref.update({"lastRunStatus": "failed"})
+
+            return _ok({
+                "runId": run_ref.id,
+                "status": "failed",
+                "error": str(e),
+            })
+
+    else:
+        # ---- Scrapy spiders — not yet supported in Cloud Functions ----
+        run_ref.set({
+            "spiderName": spider_name,
+            "status": "failed",
+            "startedAt": now,
+            "completedAt": now,
+            "triggeredBy": decoded["uid"],
+            "config": {
+                "targetStates": target_states,
+                "itemLimit": item_limit,
+            },
+            "stats": {
+                "itemsFound": 0,
+                "itemsLoaded": 0,
+                "errors": 1,
+                "duration": 0,
+            },
+            "errorLog": [
+                "Scrapy-based spiders are not yet supported for on-demand "
+                "runs from the dashboard. Use the CLI worker instead."
+            ],
+        })
+        config_ref.set(
+            {"lastRunAt": now, "lastRunStatus": "failed"}, merge=True
+        )
+
+        return _ok({
+            "runId": run_ref.id,
+            "status": "failed",
+            "error": "Scrapy spiders cannot run from the dashboard yet.",
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +522,7 @@ def get_scraper_dashboard(req: https_fn.Request) -> https_fn.Response:
                 "lastRunStatus": None,
             }
 
-    # Fetch recent runs (last 20 overall, sorted by startedAt desc)
+    # Fetch recent runs (last 50 overall, sorted by startedAt desc)
     runs_query = (
         _get_db().collection("_scraper_runs")
         .order_by("startedAt", direction=firestore.Query.DESCENDING)
@@ -289,12 +550,9 @@ def get_scraper_dashboard(req: https_fn.Request) -> https_fn.Response:
 # 5. scheduled_api_sync — run RIDB + NPS sync on schedule
 # ---------------------------------------------------------------------------
 
-@scheduler_fn.on_schedule(schedule="every sunday 02:00")
+@scheduler_fn.on_schedule(schedule="every sunday 02:00", timeout_sec=540, memory=512)
 def scheduled_api_sync(event: scheduler_fn.ScheduledEvent) -> None:
     """Weekly sync of Recreation.gov and NPS campground data."""
-    import logging
-
-    logger = logging.getLogger(__name__)
     logger.info("Starting scheduled API sync at %s", datetime.now(timezone.utc))
 
     now = datetime.now(timezone.utc)
@@ -313,51 +571,28 @@ def scheduled_api_sync(event: scheduler_fn.ScheduledEvent) -> None:
     })
 
     try:
-        import sys
-        from pathlib import Path
+        total_stats = {"itemsFound": 0, "itemsLoaded": 0, "errors": 0}
+        all_errors = []
 
-        backend_root = str(Path(__file__).resolve().parent.parent / "backend")
-        if backend_root not in sys.path:
-            sys.path.insert(0, backend_root)
-
-        from sources.recreation_gov import RecreationGovSource
-        from sources.nps_api import NPSSource
-        from transforms.normalizer import normalize_recreation_gov, normalize_nps
-        from loaders.firestore_loader import FirestoreLoader
-
-        loader = FirestoreLoader()
-        all_records = []
-
-        # Phase 1: Recreation.gov
-        logger.info("Fetching Recreation.gov campgrounds...")
-        rec_source = RecreationGovSource()
-        for facility in rec_source.fetch_all_campgrounds():
-            normalized = normalize_recreation_gov(facility)
-            all_records.append(normalized)
-
-        # Phase 2: NPS
-        logger.info("Fetching NPS campgrounds...")
-        nps_source = NPSSource()
-        for campground in nps_source.fetch_all_campgrounds():
-            normalized = normalize_nps(campground)
-            all_records.append(normalized)
-
-        # Phase 3: Load to Firestore
-        logger.info("Loading %d records to Firestore...", len(all_records))
-        stats = loader.upsert_batch(all_records)
+        for source_name in ["recreation_gov", "nps"]:
+            stats, error_log = _execute_api_source(
+                source_name, None, None, run_ref
+            )
+            total_stats["itemsFound"] += stats["itemsFound"]
+            total_stats["itemsLoaded"] += stats["itemsLoaded"]
+            total_stats["errors"] += stats["errors"]
+            all_errors.extend(error_log)
 
         elapsed = (datetime.now(timezone.utc) - now).total_seconds()
+        total_stats["duration"] = round(elapsed, 1)
+
         run_ref.update({
             "status": "completed",
             "completedAt": datetime.now(timezone.utc),
-            "stats": {
-                "itemsFound": len(all_records),
-                "itemsLoaded": stats.get("created", 0) + stats.get("updated", 0),
-                "errors": stats.get("failed", 0),
-                "duration": elapsed,
-            },
+            "stats": total_stats,
+            "errorLog": all_errors[:50],
         })
-        logger.info("API sync completed: %s", stats)
+        logger.info("API sync completed: %s", total_stats)
 
     except Exception as e:
         logger.exception("API sync failed: %s", e)
@@ -375,9 +610,6 @@ def scheduled_api_sync(event: scheduler_fn.ScheduledEvent) -> None:
 @scheduler_fn.on_schedule(schedule="every 1 hours")
 def scheduled_scraper_check(event: scheduler_fn.ScheduledEvent) -> None:
     """Check _scraper_configs for spiders due to run based on schedule."""
-    import logging
-
-    logger = logging.getLogger(__name__)
     now = datetime.now(timezone.utc)
 
     schedule_intervals = {

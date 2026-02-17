@@ -161,6 +161,9 @@ export default function DashboardPage() {
         <Link to="/admin/scrapers" className="btn-primary">
           Manage Scrapers
         </Link>
+        <Link to="/admin/inventory" className="btn-primary">
+          Campground Inventory
+        </Link>
         <Link to="/admin/runs" className="btn-outline">
           View Run History
         </Link>

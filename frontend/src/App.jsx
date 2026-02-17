@@ -17,6 +17,7 @@ const DashboardPage = lazy(() => import('./pages/admin/DashboardPage'));
 const ScrapersPage = lazy(() => import('./pages/admin/ScrapersPage'));
 const SpiderDetailPage = lazy(() => import('./pages/admin/SpiderDetailPage'));
 const RunHistoryPage = lazy(() => import('./pages/admin/RunHistoryPage'));
+const InventoryPage = lazy(() => import('./pages/admin/InventoryPage'));
 
 export default function App() {
   return (
@@ -67,6 +68,14 @@ export default function App() {
             element={
               <AdminRoute>
                 <RunHistoryPage />
+              </AdminRoute>
+            }
+          />
+          <Route
+            path="/admin/inventory"
+            element={
+              <AdminRoute>
+                <InventoryPage />
               </AdminRoute>
             }
           />
