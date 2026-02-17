@@ -85,10 +85,10 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // 0c. SCRAPER CONFIGS (super_admin read via dashboard)
+    // 0c. SCRAPER CONFIGS (super_admin read/write via dashboard)
     match /_scraper_configs/{spiderName} {
       allow read: if isSuperAdmin();
-      allow write: if false;  // Only Cloud Functions write
+      allow write: if isSuperAdmin();
     }
 
     // 0d. SCRAPER RUNS (super_admin read via dashboard)

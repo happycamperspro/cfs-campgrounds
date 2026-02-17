@@ -7,6 +7,7 @@
   packages = [
     # pkgs.go
     pkgs.python314
+    pkgs.python313
     pkgs.uv
     # pkgs.python311Packages.pip
     pkgs.nodejs_20

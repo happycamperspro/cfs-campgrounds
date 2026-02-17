@@ -1,15 +1,15 @@
-import { useState, useEffect } from 'react';
-import { collection, onSnapshot } from 'firebase/firestore';
+import { useState, useEffect, useCallback } from 'react';
+import { collection, doc, onSnapshot, updateDoc } from 'firebase/firestore';
 import { db } from '../config/firebase';
 
 /**
  * Hook that maintains a realtime listener on the `_scraper_configs` collection.
- * Returns configs as an object keyed by spider name (document ID).
+ * Returns configs as an array, plus helper functions for toggling and updating.
  *
- * @returns {{ configs: object, loading: boolean, error: Error|null }}
+ * @returns {{ configs: array, loading: boolean, error: Error|null, toggleEnabled: Function, updateConfig: Function }}
  */
 export function useScraperConfigs() {
-  const [configs, setConfigs] = useState({});
+  const [configs, setConfigs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -19,10 +19,11 @@ export function useScraperConfigs() {
     const unsubscribe = onSnapshot(
       configsRef,
       (snapshot) => {
-        const result = {};
-        snapshot.docs.forEach((doc) => {
-          result[doc.id] = { id: doc.id, ...doc.data() };
-        });
+        const result = snapshot.docs.map((d) => ({
+          id: d.id,
+          name: d.id,
+          ...d.data(),
+        }));
         setConfigs(result);
         setLoading(false);
         setError(null);
@@ -36,5 +37,17 @@ export function useScraperConfigs() {
     return () => unsubscribe();
   }, []);
 
-  return { configs, loading, error };
+  const toggleEnabled = useCallback(async (spiderName) => {
+    const config = configs.find((c) => c.name === spiderName);
+    if (!config) return;
+    const configRef = doc(db, '_scraper_configs', spiderName);
+    await updateDoc(configRef, { enabled: !config.enabled });
+  }, [configs]);
+
+  const updateConfig = useCallback(async (spiderName, data) => {
+    const configRef = doc(db, '_scraper_configs', spiderName);
+    await updateDoc(configRef, data);
+  }, []);
+
+  return { configs, loading, error, toggleEnabled, updateConfig };
 }

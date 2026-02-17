@@ -18,13 +18,6 @@ L.Icon.Default.mergeOptions({
 const US_CENTER = [39.8, -98.5];
 const DEFAULT_ZOOM = 4;
 
-let MarkerClusterGroup = null;
-try {
-  MarkerClusterGroup = require('react-leaflet-markercluster').default;
-} catch {
-  // react-leaflet-markercluster not available; will render markers directly
-}
-
 export default function CampgroundMap({ campgrounds = [] }) {
   const validCampgrounds = campgrounds.filter(
     (c) => c.location?.latitude && c.location?.longitude
@@ -45,11 +38,7 @@ export default function CampgroundMap({ campgrounds = [] }) {
         attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
         url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
       />
-      {MarkerClusterGroup ? (
-        <MarkerClusterGroup>{markers}</MarkerClusterGroup>
-      ) : (
-        markers
-      )}
+      {markers}
     </MapContainer>
   );
 }

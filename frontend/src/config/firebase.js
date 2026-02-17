@@ -1,6 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager } from 'firebase/firestore';
-import { getAuth } from 'firebase/auth';
+import { getAuth, GoogleAuthProvider } from 'firebase/auth';
 
 const firebaseConfig = {
   projectId: 'hcp-social-chat-firebase-host',
@@ -25,5 +25,6 @@ try {
 }
 
 const auth = getAuth(app);
+const googleProvider = new GoogleAuthProvider();
 
-export { app, db, auth };
+export { app, db, auth, googleProvider };
