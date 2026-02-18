@@ -14,21 +14,21 @@ L.Icon.Default.mergeOptions({
 });
 
 export default function DetailMap({ latitude, longitude, name }) {
-  if (!latitude || !longitude) return null;
+  const lat = Number(latitude);
+  const lng = Number(longitude);
+  if (!isFinite(lat) || !isFinite(lng)) return null;
 
   return (
     <MapContainer
-      center={[latitude, longitude]}
+      center={[lat, lng]}
       zoom={12}
       className="w-full rounded-xl z-0"
       style={{ height: '300px' }}
       scrollWheelZoom={false}
+      attributionControl={false}
     >
-      <TileLayer
-        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-      />
-      <Marker position={[latitude, longitude]}>
+      <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+      <Marker position={[lat, lng]}>
         <Popup>{name}</Popup>
       </Marker>
     </MapContainer>
